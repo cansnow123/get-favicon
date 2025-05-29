@@ -12,6 +12,10 @@ class FaviconFetcher
     private int $cacheTtl;
     private array $options;
     private array $proxies;
+    private array $proxyStats = []; // 代理服务器状态统计
+    private array $domainConfig;    // 域名配置
+    private array $proxyConfig;     // 代理配置
+    private SvgGenerator $svgGenerator; // SVG生成器
     
     /**
      * 构造函数
@@ -32,25 +36,25 @@ class FaviconFetcher
         $this->cacheDir = $cacheDir;
         $this->defaultIcon = $defaultIcon;
         $this->cacheTtl = $cacheTtl;
+        
+        // 加载配置文件
+        $this->domainConfig = require __DIR__ . '/../config/domains.php';
+        $this->proxyConfig = require __DIR__ . '/../config/proxies.php';
+        
+        // 合并选项
         $this->options = array_merge([
             'timeout' => 5,
             'user_agent' => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
             'debug' => false,
             'max_retries' => 2,  // 最大重试次数
-            'retry_delay' => 1   // 重试延迟（秒）
+            'retry_delay' => 1,  // 重试延迟（秒）
         ], $options);
         
-        // 设置默认代理配置
-        $this->proxies = array_merge([
-            'cn' => [  // 中国大陆代理
-                'http' => null,
-                'https' => null
-            ],
-            'global' => [  // 境外代理
-                'http' => null,
-                'https' => null
-            ]
-        ], $proxies);
+        // 设置代理配置
+        $this->proxies = array_merge($this->proxyConfig['servers'], $proxies);
+        
+        // 初始化SVG生成器
+        $this->svgGenerator = new SvgGenerator();
         
         $this->ensureCacheDirectoryExists();
     }
@@ -63,23 +67,121 @@ class FaviconFetcher
      */
     private function isChineseDomain(string $host): bool
     {
-        // 常见中国大陆域名后缀
-        $cnSuffixes = [
-            '.cn', '.com.cn', '.net.cn', '.org.cn', '.gov.cn', '.edu.cn',
-            '.ac.cn', '.mil.cn', '.biz.cn', '.info.cn', '.name.cn',
-            '.moe.cn', '.xn--fiqs8s', // 中文域名
-        ];
+        // 1. 检查白名单
+        foreach ($this->domainConfig['cn_whitelist'] as $domain) {
+            if (strcasecmp($host, $domain) === 0 || strcasecmp(substr($host, -strlen($domain) - 1), '.' . $domain) === 0) {
+                return true;
+            }
+        }
         
-        foreach ($cnSuffixes as $suffix) {
+        // 2. 检查黑名单
+        foreach ($this->domainConfig['global_whitelist'] as $domain) {
+            if (strcasecmp($host, $domain) === 0 || strcasecmp(substr($host, -strlen($domain) - 1), '.' . $domain) === 0) {
+                return false;
+            }
+        }
+        
+        // 3. 检查域名后缀
+        foreach ($this->domainConfig['cn_suffixes'] as $suffix) {
             if (strcasecmp(substr($host, -strlen($suffix)), $suffix) === 0) {
                 return true;
             }
         }
         
-        // 检查IP是否为中国大陆IP（这里可以接入IP数据库）
-        // TODO: 接入IP数据库进行更准确的判断
-        
         return false;
+    }
+
+    /**
+     * 获取可用的代理配置
+     *
+     * @param string $type 代理类型（cn/global）
+     * @return array|null
+     */
+    private function getAvailableProxy(string $type): ?array
+    {
+        if (!isset($this->proxies[$type])) {
+            return null;
+        }
+
+        $availableProxies = [];
+        foreach ($this->proxies[$type] as $proxy) {
+            $proxyName = $proxy['name'];
+            $stats = $this->proxyStats[$proxyName] ?? [
+                'fails' => 0,
+                'last_fail' => 0,
+                'last_check' => 0
+            ];
+
+            // 检查代理是否可用
+            if ($stats['fails'] >= $this->options['proxy_fail_threshold']) {
+                // 检查是否已经过了恢复时间
+                if (time() - $stats['last_fail'] < $this->options['proxy_recovery_time']) {
+                    continue;
+                }
+                // 重置失败计数
+                $stats['fails'] = 0;
+            }
+
+            // 检查代理状态
+            if (time() - $stats['last_check'] > $this->options['proxy_check_interval']) {
+                if ($this->checkProxy($proxy)) {
+                    $stats['last_check'] = time();
+                    $stats['fails'] = 0;
+                } else {
+                    $stats['fails']++;
+                    $stats['last_fail'] = time();
+                    continue;
+                }
+            }
+
+            $this->proxyStats[$proxyName] = $stats;
+            $availableProxies[] = $proxy;
+        }
+
+        if (empty($availableProxies)) {
+            return null;
+        }
+
+        // 根据权重随机选择代理
+        $totalWeight = array_sum(array_column($availableProxies, 'weight'));
+        $random = mt_rand(1, $totalWeight);
+        $currentWeight = 0;
+
+        foreach ($availableProxies as $proxy) {
+            $currentWeight += $proxy['weight'];
+            if ($random <= $currentWeight) {
+                return $proxy;
+            }
+        }
+
+        return $availableProxies[0];
+    }
+
+    /**
+     * 检查代理是否可用
+     *
+     * @param array $proxy
+     * @return bool
+     */
+    private function checkProxy(array $proxy): bool
+    {
+        $proxyType = isset($this->proxies['cn'][$proxy['name']]) ? 'cn' : 'global';
+        $testUrl = $this->proxyConfig['health_check']['test_url'][$proxyType];
+        
+        $context = stream_context_create([
+            'http' => [
+                'timeout' => $this->proxyConfig['health_check']['timeout'],
+                'proxy' => $proxy['http'] ?? $proxy['https'],
+                'request_fulluri' => true
+            ],
+            'ssl' => [
+                'verify_peer' => false,
+                'verify_peer_name' => false
+            ]
+        ]);
+
+        $result = @file_get_contents($testUrl, false, $context);
+        return $result !== false;
     }
 
     /**
@@ -91,10 +193,38 @@ class FaviconFetcher
     private function getProxyConfig(string $url): ?array
     {
         $host = parse_url($url, PHP_URL_HOST);
-        if ($this->isChineseDomain($host)) {
-            return $this->proxies['cn'];
+        $isChinese = $this->isChineseDomain($host);
+        
+        // 根据配置决定是否使用代理
+        if ($isChinese && !$this->proxyConfig['strategy']['use_proxy_for_cn']) {
+            return null;
         }
-        return $this->proxies['global'];
+        if (!$isChinese && !$this->proxyConfig['strategy']['use_proxy_for_global']) {
+            return null;
+        }
+        
+        $proxyType = $isChinese ? 'cn' : 'global';
+        return $this->getAvailableProxy($proxyType);
+    }
+
+    /**
+     * 记录代理失败
+     *
+     * @param array $proxy
+     */
+    private function recordProxyFailure(array $proxy): void
+    {
+        $proxyName = $proxy['name'];
+        if (!isset($this->proxyStats[$proxyName])) {
+            $this->proxyStats[$proxyName] = [
+                'fails' => 0,
+                'last_fail' => 0,
+                'last_check' => 0
+            ];
+        }
+
+        $this->proxyStats[$proxyName]['fails']++;
+        $this->proxyStats[$proxyName]['last_fail'] = time();
     }
 
     /**
@@ -102,11 +232,12 @@ class FaviconFetcher
      *
      * @param string $url
      * @param array $headers
-     * @return resource
+     * @param array|null $proxy
+     * @return mixed
      */
-    private function createContext(string $url, array $headers = []): resource
+    private function createContext(string $url, array $headers = [], ?array $proxy = null): mixed
     {
-        $proxyConfig = $this->getProxyConfig($url);
+        $proxyConfig = $proxy ? $proxy : $this->getProxyConfig($url);
         $contextOptions = [
             'http' => [
                 'timeout' => $this->options['timeout'],
@@ -146,14 +277,28 @@ class FaviconFetcher
     {
         $retries = 0;
         $lastError = null;
+        $usedProxies = [];
         
         while ($retries <= $this->options['max_retries']) {
             try {
-                $context = $this->createContext($url, $headers);
+                $proxy = $this->getProxyConfig($url);
+                if ($proxy) {
+                    // 避免重复使用同一个代理
+                    if (in_array($proxy['name'], $usedProxies)) {
+                        continue;
+                    }
+                    $usedProxies[] = $proxy['name'];
+                }
+
+                $context = $this->createContext($url, $headers, $proxy);
                 $content = @file_get_contents($url, false, $context);
                 
                 if ($content !== false) {
                     return $content;
+                }
+                
+                if ($proxy) {
+                    $this->recordProxyFailure($proxy);
                 }
                 
                 $lastError = error_get_last();
@@ -166,6 +311,10 @@ class FaviconFetcher
                     sleep($this->options['retry_delay']);
                 }
             } catch (\Exception $e) {
+                if ($proxy) {
+                    $this->recordProxyFailure($proxy);
+                }
+                
                 $lastError = $e;
                 if ($this->options['debug']) {
                     error_log("Exception on attempt {$retries} for {$url}: " . $e->getMessage());
@@ -187,6 +336,30 @@ class FaviconFetcher
     }
     
     /**
+     * 获取默认图标
+     *
+     * @param string|null $host 域名
+     * @return array{content: string, mime: string, cached: bool}
+     * @throws \Exception
+     */
+    private function getDefaultIcon(?string $host = null): array
+    {
+        // 如果host为空，使用默认值
+        if (empty($host)) {
+            $host = 'default';
+        }
+        
+        // 生成动态SVG图标
+        $content = $this->svgGenerator->generate($host);
+        
+        return [
+            'content' => $content,
+            'mime' => 'image/svg+xml',
+            'cached' => false
+        ];
+    }
+
+    /**
      * 获取网站的favicon
      *
      * @param string $url 网站URL
@@ -196,79 +369,94 @@ class FaviconFetcher
      */
     public function fetch(string $url, bool $refresh = false): array
     {
-        $url = $this->normalizeUrl($url);
-        $cacheFile = $this->getCacheFile($url);
-        
-        // 检查缓存
-        if (!$refresh) {
-            // 尝试读取缓存文件（不指定扩展名）
-            $cacheFiles = glob($cacheFile . '.*');
-            if (!empty($cacheFiles)) {
-                $cacheFile = $cacheFiles[0];
-                $content = @file_get_contents($cacheFile);
-                if ($content !== false) {
-                    $mime = $this->getMimeType($content);
-                    // 如果是SVG，直接返回
-                    if ($mime === 'image/svg+xml') {
+        try {
+            $url = $this->normalizeUrl($url);
+            $host = parse_url($url, PHP_URL_HOST);
+            
+            // 如果无法解析host，使用URL作为备用
+            if (empty($host)) {
+                $host = $url;
+            }
+            
+            $cacheFile = $this->getCacheFile($url);
+            
+            // 检查缓存
+            if (!$refresh) {
+                // 尝试读取缓存文件（不指定扩展名）
+                $cacheFiles = glob($cacheFile . '.*');
+                if (!empty($cacheFiles)) {
+                    $cacheFile = $cacheFiles[0];
+                    $content = @file_get_contents($cacheFile);
+                    if ($content !== false) {
+                        $mime = $this->getMimeType($content);
+                        // 如果是SVG，直接返回
+                        if ($mime === 'image/svg+xml') {
+                            return [
+                                'content' => $content,
+                                'mime' => $mime,
+                                'cached' => true
+                            ];
+                        }
+                        // 对于其他格式，如果不是PNG，尝试转换
+                        if ($mime !== 'image/png') {
+                            $converted = $this->convertToPng($content, $mime);
+                            if ($converted) {
+                                // 保存转换后的PNG
+                                $pngFile = $cacheFile . '.png';
+                                @file_put_contents($pngFile, $converted);
+                                // 删除原缓存文件
+                                @unlink($cacheFile);
+                                return [
+                                    'content' => $converted,
+                                    'mime' => 'image/png',
+                                    'cached' => true
+                                ];
+                            }
+                        }
+                        // 如果是PNG或转换失败，直接返回原内容
                         return [
                             'content' => $content,
                             'mime' => $mime,
                             'cached' => true
                         ];
                     }
+                }
+            }
+            
+            // 获取新的图标
+            $result = $this->fetchFromUrl($url);
+            
+            // 保存到缓存
+            if ($result['content']) {
+                // 根据MIME类型决定文件扩展名
+                $extension = $this->getExtensionFromMime($result['mime']);
+                $cacheFile = $this->getCacheFile($url) . '.' . $extension;
+                
+                // 如果是SVG，直接保存
+                if ($result['mime'] === 'image/svg+xml') {
+                    @file_put_contents($cacheFile, $result['content']);
+                } else {
                     // 对于其他格式，如果不是PNG，尝试转换
-                    if ($mime !== 'image/png') {
-                        $converted = $this->convertToPng($content, $mime);
+                    if ($result['mime'] !== 'image/png') {
+                        $converted = $this->convertToPng($result['content'], $result['mime']);
                         if ($converted) {
-                            // 保存转换后的PNG
-                            $pngFile = $cacheFile . '.png';
-                            @file_put_contents($pngFile, $converted);
-                            // 删除原缓存文件
-                            @unlink($cacheFile);
-                            return [
-                                'content' => $converted,
-                                'mime' => 'image/png',
-                                'cached' => true
-                            ];
+                            $result['content'] = $converted;
+                            $result['mime'] = 'image/png';
+                            $cacheFile = $this->getCacheFile($url) . '.png';
                         }
                     }
-                    // 如果是PNG或转换失败，直接返回原内容
-                    return [
-                        'content' => $content,
-                        'mime' => $mime,
-                        'cached' => true
-                    ];
+                    @file_put_contents($cacheFile, $result['content']);
                 }
             }
-        }
-        
-        // 获取新的图标
-        $result = $this->fetchFromUrl($url);
-        
-        // 保存到缓存
-        if ($result['content']) {
-            // 根据MIME类型决定文件扩展名
-            $extension = $this->getExtensionFromMime($result['mime']);
-            $cacheFile = $this->getCacheFile($url) . '.' . $extension;
             
-            // 如果是SVG，直接保存
-            if ($result['mime'] === 'image/svg+xml') {
-                @file_put_contents($cacheFile, $result['content']);
-            } else {
-                // 对于其他格式，如果不是PNG，尝试转换
-                if ($result['mime'] !== 'image/png') {
-                    $converted = $this->convertToPng($result['content'], $result['mime']);
-                    if ($converted) {
-                        $result['content'] = $converted;
-                        $result['mime'] = 'image/png';
-                        $cacheFile = $this->getCacheFile($url) . '.png';
-                    }
-                }
-                @file_put_contents($cacheFile, $result['content']);
+            return $result;
+        } catch (\Exception $e) {
+            if ($this->options['debug']) {
+                error_log('Error in fetch: ' . $e->getMessage());
             }
+            // 确保在出错时也能返回默认图标
+            return $this->getDefaultIcon($url);
         }
-        
-        return $result;
     }
     
     /**
@@ -281,6 +469,12 @@ class FaviconFetcher
     private function fetchFromUrl(string $url): array
     {
         try {
+            $host = parse_url($url, PHP_URL_HOST);
+            // 如果无法解析host，使用URL作为备用
+            if (empty($host)) {
+                $host = $url;
+            }
+            
             // 1. 尝试从HTML中获取图标链接
             $html = $this->getHtmlContent($url);
             $iconUrl = $this->extractIconUrlFromHtml($html, $url);
@@ -293,8 +487,29 @@ class FaviconFetcher
             }
             
             // 2. 尝试常见的图标路径
+            $scheme = parse_url($url, PHP_URL_SCHEME) ?: 'http';
+            
+            // 2.1 尝试根目录下的图标
             foreach (self::SUPPORTED_FORMATS as $format) {
-                $iconUrl = $this->buildIconUrl($url, $format);
+                $iconUrl = "{$scheme}://{$host}/favicon.{$format}";
+                $icon = $this->downloadIcon($iconUrl);
+                if ($icon) {
+                    return $icon;
+                }
+            }
+            
+            // 2.2 尝试 /static/ 目录下的图标
+            foreach (self::SUPPORTED_FORMATS as $format) {
+                $iconUrl = "{$scheme}://{$host}/static/favicon.{$format}";
+                $icon = $this->downloadIcon($iconUrl);
+                if ($icon) {
+                    return $icon;
+                }
+            }
+            
+            // 2.3 尝试 /assets/ 目录下的图标
+            foreach (self::SUPPORTED_FORMATS as $format) {
+                $iconUrl = "{$scheme}://{$host}/assets/favicon.{$format}";
                 $icon = $this->downloadIcon($iconUrl);
                 if ($icon) {
                     return $icon;
@@ -302,20 +517,28 @@ class FaviconFetcher
             }
             
             // 3. 尝试Google的favicon服务
-            $googleIconUrl = "https://www.google.com/s2/favicons?domain=" . parse_url($url, PHP_URL_HOST);
+            $googleIconUrl = "https://www.google.com/s2/favicons?domain=" . $host;
             $icon = $this->downloadIcon($googleIconUrl);
             if ($icon) {
                 return $icon;
             }
             
-            // 4. 返回默认图标
-            return $this->getDefaultIcon();
+            // 4. 尝试 DuckDuckGo 的 favicon 服务
+            $ddgIconUrl = "https://icons.duckduckgo.com/ip3/{$host}.ico";
+            $icon = $this->downloadIcon($ddgIconUrl);
+            if ($icon) {
+                return $icon;
+            }
+            
+            // 5. 返回默认图标
+            return $this->getDefaultIcon($host);
             
         } catch (\Exception $e) {
             if ($this->options['debug']) {
                 error_log('Error fetching favicon: ' . $e->getMessage());
             }
-            return $this->getDefaultIcon();
+            // 确保在出错时也能返回默认图标
+            return $this->getDefaultIcon($url);
         }
     }
     
@@ -457,19 +680,6 @@ class FaviconFetcher
     }
     
     /**
-     * 构建常见的图标URL
-     *
-     * @param string $url
-     * @param string $format
-     * @return string
-     */
-    private function buildIconUrl(string $url, string $format): string
-    {
-        $host = parse_url($url, PHP_URL_HOST);
-        return "https://{$host}/favicon.{$format}";
-    }
-    
-    /**
      * 验证是否为有效的图片
      *
      * @param string $content
@@ -504,28 +714,6 @@ class FaviconFetcher
     {
         $finfo = new \finfo(FILEINFO_MIME_TYPE);
         return $finfo->buffer($content);
-    }
-    
-    /**
-     * 获取默认图标
-     *
-     * @return array{content: string, mime: string, cached: bool}
-     * @throws \Exception
-     */
-    private function getDefaultIcon(): array
-    {
-        if (!file_exists($this->defaultIcon)) {
-            throw new \Exception('Default icon file not found');
-        }
-        
-        $content = file_get_contents($this->defaultIcon);
-        $mime = $this->getMimeType($content);
-        
-        return [
-            'content' => $content,
-            'mime' => $mime,
-            'cached' => false
-        ];
     }
     
     /**
