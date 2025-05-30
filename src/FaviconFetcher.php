@@ -16,6 +16,7 @@ class FaviconFetcher
     private array $domainConfig;    // 域名配置
     private array $proxyConfig;     // 代理配置
     private SvgGenerator $svgGenerator; // SVG生成器
+    private int $cleanupTtl = 2592000; // 30天的缓存清理时间（秒）
     
     /**
      * 构造函数
@@ -48,6 +49,7 @@ class FaviconFetcher
             'debug' => false,
             'max_retries' => 2,  // 最大重试次数
             'retry_delay' => 1,  // 重试延迟（秒）
+            'cleanup_ttl' => 2592000, // 30天的缓存清理时间
         ], $options);
         
         // 设置代理配置
@@ -57,6 +59,47 @@ class FaviconFetcher
         $this->svgGenerator = new SvgGenerator();
         
         $this->ensureCacheDirectoryExists();
+        
+        // 执行缓存清理
+        $this->cleanupCache();
+    }
+    
+    /**
+     * 清理过期缓存文件
+     *
+     * @return void
+     */
+    private function cleanupCache(): void
+    {
+        if (!is_dir($this->cacheDir)) {
+            return;
+        }
+
+        $cleanupTtl = $this->options['cleanup_ttl'] ?? $this->cleanupTtl;
+        $now = time();
+
+        $files = glob($this->cacheDir . '/*');
+        foreach ($files as $file) {
+            if (is_file($file)) {
+                $fileTime = filemtime($file);
+                if ($now - $fileTime > $cleanupTtl) {
+                    unlink($file);
+                    if ($this->options['debug']) {
+                        error_log("Deleted expired cache file: " . $file);
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * 手动触发缓存清理
+     *
+     * @return void
+     */
+    public function cleanup(): void
+    {
+        $this->cleanupCache();
     }
     
     /**
