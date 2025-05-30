@@ -1,6 +1,12 @@
 # 🎯 GetFavicon
 
-一个优雅而强大的PHP网站图标获取工具，支持智能代理、自动生成默认图标、缓存管理等特性。
+一个简单而强大的PHP网站图标获取工具，支持自动生成默认图标、代理访问、缓存管理等功能。
+
+https://github.com/cansnow123/get-favicon
+
+灵感来源：https://github.com/owen0o0/getFavicon
+
+搭配这个项目使用会很丝滑：https://shortcut.devdeg.com/  （捷径 让每个目标触手可及）
 
 ## ✨ 特性
 
